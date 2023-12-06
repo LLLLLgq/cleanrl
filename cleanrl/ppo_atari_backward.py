@@ -3,6 +3,7 @@ import argparse
 import os
 import random
 import time
+import math
 from distutils.util import strtobool
 
 import gym
@@ -31,8 +32,8 @@ def parse_args():
         help="seed of the experiment")
     parser.add_argument("--torch-deterministic", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="if toggled, `torch.backends.cudnn.deterministic=False`")
-    parser.add_argument("--device", type=str, default='cuda:0',
-                        help="sets device for model and PyTorch tensors (cuda or cpu)")
+    parser.add_argument("--device", type=str, default='cuda:0', 
+        help="sets device for model and PyTorch tensors (cuda or cpu)")
     parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="if toggled, this experiment will be tracked with Weights and Biases")
     parser.add_argument("--wandb-project-name", type=str, default="cleanRL",
@@ -143,6 +144,24 @@ class Agent(nn.Module):
         return action, probs.log_prob(action), probs.entropy(), self.critic(hidden)
 
 
+def pretrain(t: torch.tensor, partition: float) -> torch.tensor:
+    """Pretrain the model with the given partition of the data.
+    Assuming the partition is quarter, 
+    we will split t into [t0, t1, t2, t3].
+    Then we will change t to [t3, t3, t3, t3].
+    """
+    t_length = t.shape[0]
+    one = [1 for _ in range(len(t.shape) - 1)]
+    # reverse t
+    if len(one) == 0:
+        p_t = t.flip(0)[:int(t_length * partition)].repeat(
+            math.ceil(1 / partition))
+    else:
+        p_t = t.flip(0)[:int(t_length * partition)].repeat(
+            math.ceil(1 / partition), *one)
+    return p_t[:t_length]
+
+
 if __name__ == "__main__":
     args = parse_args()
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
@@ -172,6 +191,7 @@ if __name__ == "__main__":
     torch.backends.cudnn.deterministic = args.torch_deterministic
 
     device = torch.device(args.device)
+
     # env setup
     envs = gym.vector.SyncVectorEnv(
         [make_env(args.env_id, args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)]
@@ -217,6 +237,10 @@ if __name__ == "__main__":
 
             # TRY NOT TO MODIFY: execute the game and log data.
             next_obs, reward, done, info = envs.step(action.cpu().numpy())
+            if step == args.num_steps - 1:
+                done = np.ones_like(done)
+            else:
+                done = np.zeros_like(done)
             rewards[step] = torch.tensor(reward).to(device).view(-1)
             next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(done).to(device)
 
@@ -242,17 +266,25 @@ if __name__ == "__main__":
                 delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t]
                 advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
             returns = advantages + values
+            
+        partition = min((update + 500 - 1) // 500 * 0.25, 1)
+        obs_ = pretrain(obs, partition)
+        logprobs_ = pretrain(logprobs, partition)
+        actions_ = pretrain(actions, partition)
+        advantages_ = pretrain(advantages, partition)
+        returns_ = pretrain(returns, partition)
+        values_ = pretrain(values, partition)
 
         # flatten the batch
-        b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
-        b_logprobs = logprobs.reshape(-1)
-        b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
-        b_advantages = advantages.reshape(-1)
-        b_returns = returns.reshape(-1)
-        b_values = values.reshape(-1)
+        b_obs = obs_.reshape((-1,) + envs.single_observation_space.shape)
+        b_logprobs = logprobs_.reshape(-1)
+        b_actions = actions_.reshape((-1,) + envs.single_action_space.shape)
+        b_advantages = advantages_.reshape(-1)
+        b_returns = returns_.reshape(-1)
+        b_values = values_.reshape(-1)
 
         # Optimizing the policy and value network
-        b_inds = np.arange(args.batch_size)
+        b_inds = np.arange(b_obs.shape[0])
         clipfracs = []
         for epoch in range(args.update_epochs):
             np.random.shuffle(b_inds)
